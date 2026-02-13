@@ -1,0 +1,5 @@
+name: netlify-plugin-prebuild
+inputs:
+  - name: message
+    required: false
+    description: Optional message to display
