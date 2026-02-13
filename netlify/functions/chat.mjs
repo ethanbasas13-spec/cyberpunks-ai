@@ -1,37 +1,7 @@
-import { createServer } from 'node:http'
-import { readFileSync, existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-function loadEnvFile() {
-  const envPath = resolve(process.cwd(), '.env')
-  if (!existsSync(envPath)) return
-
-  const raw = readFileSync(envPath, 'utf8')
-  const lines = raw.split(/\r?\n/)
-
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eqIndex = trimmed.indexOf('=')
-    if (eqIndex === -1) continue
-
-    const key = trimmed.slice(0, eqIndex).trim()
-    let value = trimmed.slice(eqIndex + 1).trim()
-
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1)
-    }
-
-    if (!(key in process.env)) {
-      process.env[key] = value
-    }
-  }
-}
-
-loadEnvFile()
-
-const PORT = Number(process.env.PORT || 3001)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite'
 const __filename = fileURLToPath(import.meta.url)
@@ -55,7 +25,7 @@ function normalizeCharacterName(name) {
 function readPersonaFile() {
   const candidates = [
     resolve(process.cwd(), 'persona.txt'),
-    resolve(__dirname, 'persona.txt'),
+    resolve(__dirname, '../../persona.txt'),
   ]
 
   for (const path of candidates) {
@@ -90,28 +60,17 @@ function parsePersonaSections(rawText) {
 const PERSONA_TEXT = readPersonaFile()
 const PERSONA_SECTIONS = parsePersonaSections(PERSONA_TEXT)
 
-function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  })
-  res.end(JSON.stringify(payload))
-}
-
-function collectBody(req) {
-  return new Promise((resolveBody, rejectBody) => {
-    let body = ''
-    req.on('data', (chunk) => {
-      body += chunk
-      if (body.length > 1_000_000) {
-        rejectBody(new Error('Request body is too large.'))
-      }
-    })
-    req.on('end', () => resolveBody(body))
-    req.on('error', rejectBody)
-  })
+function jsonResponse(statusCode, payload) {
+  return {
+    statusCode,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    },
+    body: JSON.stringify(payload),
+  }
 }
 
 function toGeminiRole(role) {
@@ -133,21 +92,17 @@ function getCharacterInstruction(character) {
   return PERSONA_SECTIONS[normalizedCharacter] || DEFAULT_CHARACTER_INSTRUCTIONS[normalizedCharacter]
 }
 
-function buildGeminiContents(history, message, character, persona, nsfw = false) {
+function buildGeminiContents(history, message, character, persona) {
   const safeHistory = Array.isArray(history) ? history : []
   const content = []
   const normalizedCharacter = normalizeCharacterName(character)
   const characterInstruction = getCharacterInstruction(normalizedCharacter)
 
-  const nsfwInstruction = nsfw
-    ? 'The user has explicitly allowed mature content. You may include mature themes and stronger language when contextually appropriate, but do NOT generate pornographic sexual content, sexual content involving minors, exploitative or illegal material. Prioritize consent, respect, and safety.'
-    : 'Avoid sexual or explicit content; keep responses safe for general audiences unless the user explicitly requests mature content and it is legal.'
-
   content.push({
     role: 'user',
     parts: [
       {
-        text: `SYSTEM INSTRUCTION: You are ${normalizedCharacter}, a character in a cyberpunk chat app. Follow this character definition exactly: ${characterInstruction} Tone modifier: ${getPersonaInstruction(persona)} ${nsfwInstruction} Stay in character, be conversational, and keep answers concise unless asked for detail.`,
+        text: `SYSTEM INSTRUCTION: You are ${normalizedCharacter}, a character in a cyberpunk chat app. Follow this character definition exactly: ${characterInstruction} Tone modifier: ${getPersonaInstruction(persona)} Stay in character, be conversational, and keep answers concise unless asked for detail.`,
       },
     ],
   })
@@ -168,29 +123,28 @@ function buildGeminiContents(history, message, character, persona, nsfw = false)
   return content
 }
 
-async function chatWithGemini({ message, history, character, persona, nsfw = false }) {
+async function chatWithGemini({ message, history, character, persona }) {
   if (!GEMINI_API_KEY) {
-    throw new Error('Missing GEMINI_API_KEY. Add it to your .env file.')
+    throw new Error('Missing GEMINI_API_KEY. Add it in Netlify environment variables.')
   }
 
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`
 
   const payload = {
-    contents: buildGeminiContents(history, message, character, persona),
+    contents: buildGeminiContents(history, message, character, persona, nsfw),
     generationConfig: {
       temperature: 0.8,
       maxOutputTokens: 1024,
     },
   }
 
-  // Fetch with retries for transient errors (503/429)
+  // Retry helper to handle transient 503 / 429 responses
   async function fetchWithRetry(url, options, retries = 4, backoff = 500) {
     let attempt = 0
     while (true) {
       attempt++
       const resp = await fetch(url, options)
       if (resp.ok) return resp
-      // Retry on server busy or rate limit
       if ((resp.status === 503 || resp.status === 429) && attempt <= retries) {
         const wait = backoff * Math.pow(2, attempt - 1)
         await new Promise((r) => setTimeout(r, wait))
@@ -200,7 +154,7 @@ async function chatWithGemini({ message, history, character, persona, nsfw = fal
     }
   }
 
-  // If nsfw requests should go to an alternate explicit-content endpoint, prefer that
+  // Route NSFW requests to an explicit endpoint if configured
   const explicitUrl = process.env.EXPLICIT_API_URL
   const explicitKey = process.env.EXPLICIT_API_KEY
   if (nsfw && explicitUrl) {
@@ -209,16 +163,18 @@ async function chatWithGemini({ message, history, character, persona, nsfw = fal
       headers: Object.assign({ 'Content-Type': 'application/json' }, explicitKey ? { Authorization: `Bearer ${explicitKey}` } : {}),
       body: JSON.stringify({ message, history, character, persona, nsfw }),
     })
-
     const explicitData = await explicitResp.json().catch(() => null)
     if (explicitResp.ok) {
-      // Accept common reply fields used by simple API backends
       const explicitReply = explicitData?.reply || explicitData?.result || explicitData?.output || explicitData?.text
-      if (explicitReply && typeof explicitReply === 'string') return explicitReply.trim()
-      if (explicitReply && typeof explicitReply === 'object') return JSON.stringify(explicitReply)
-      // If explicit backend didn't return expected shape, fall through to Gemini
+      if (explicitReply && typeof explicitReply === 'string') {
+        return jsonResponse(200, { reply: explicitReply.trim() })
+      }
+      if (explicitReply && typeof explicitReply === 'object') {
+        return jsonResponse(200, { reply: JSON.stringify(explicitReply) })
+      }
+      // otherwise fall through to Gemini
     }
-    // If explicit endpoint failed, continue to Gemini with retry logic below
+    // if explicit endpoint failed, try Gemini below
   }
 
   const finalResponse = await fetchWithRetry(endpoint, {
@@ -228,17 +184,13 @@ async function chatWithGemini({ message, history, character, persona, nsfw = fal
   })
 
   const data = await finalResponse.json()
-
   if (!finalResponse.ok) {
     const apiMessage = data?.error?.message || `Gemini API request failed with status ${finalResponse.status}.`
     throw new Error(apiMessage)
   }
 
   const parts = data?.candidates?.[0]?.content?.parts
-  const reply = Array.isArray(parts)
-    ? parts.map((part) => part?.text || '').join('').trim()
-    : ''
-
+  const reply = Array.isArray(parts) ? parts.map((part) => part?.text || '').join('').trim() : ''
   if (!reply) {
     throw new Error('Gemini returned an empty response.')
   }
@@ -246,37 +198,31 @@ async function chatWithGemini({ message, history, character, persona, nsfw = fal
   return reply
 }
 
-const server = createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') {
-    return sendJson(res, 204, {})
+export async function handler(event) {
+  if (event.httpMethod === 'OPTIONS') {
+    return jsonResponse(204, {})
   }
 
-  if (req.method === 'POST' && req.url === '/api/chat') {
-    try {
-      const rawBody = await collectBody(req)
-      const body = JSON.parse(rawBody || '{}')
-      const message = typeof body.message === 'string' ? body.message.trim() : ''
-      const history = Array.isArray(body.history) ? body.history : []
-      const character = normalizeCharacterName(body.character)
-      const persona = typeof body.persona === 'string' ? body.persona.toLowerCase() : 'cool'
-      const nsfw = Boolean(body.nsfw)
+  if (event.httpMethod !== 'POST') {
+    return jsonResponse(405, { error: 'Method not allowed.' })
+  }
 
-      if (!message) {
-        return sendJson(res, 400, { error: 'Message is required.' })
-      }
+  try {
+    const body = JSON.parse(event.body || '{}')
+    const message = typeof body.message === 'string' ? body.message.trim() : ''
+    const history = Array.isArray(body.history) ? body.history : []
+    const character = normalizeCharacterName(body.character)
+    const persona = typeof body.persona === 'string' ? body.persona.toLowerCase() : 'cool'
+    const nsfw = Boolean(body.nsfw)
 
-      const reply = await chatWithGemini({ message, history, character, persona, nsfw })
-      return sendJson(res, 200, { reply })
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown server error.'
-      console.error('API handler error:', errorMessage, error)
-      return sendJson(res, 500, { error: errorMessage })
+    if (!message) {
+      return jsonResponse(400, { error: 'Message is required.' })
     }
+
+    const reply = await chatWithGemini({ message, history, character, persona, nsfw })
+    return jsonResponse(200, { reply })
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown server error.'
+    return jsonResponse(500, { error: errorMessage })
   }
-
-  return sendJson(res, 404, { error: 'Not found.' })
-})
-
-server.listen(PORT, () => {
-  console.log(`Gemini chat server listening on http://localhost:${PORT}`)
-})
+}
